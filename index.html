@@ -36,6 +36,8 @@ input[type=checkbox]{accent-color:var(--acc2);width:16px;height:16px}
 .trk .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .trk .name{flex:1;min-width:90px}
 .trk .num{width:70px}
+.trk.off{opacity:.55}
+.trk.off:focus-within,.trk.off:hover{opacity:.85}
 .badge{font-size:12px;padding:2px 7px;border-radius:99px;background:#232733;color:var(--mute)}
 .muted{color:var(--mute);font-size:13px}
 .tips{font-size:13px;color:var(--mute);margin:0;padding-left:18px}
@@ -60,6 +62,10 @@ a.btn{text-decoration:none;text-align:center}
     <div class="stagebox"><canvas id="stage" width="720" height="1280"></canvas></div>
     <div class="transport">
       <button class="btn rec" id="recBtn">● Record part</button>
+      <select id="recKind" aria-label="What to record" title="What to record">
+        <option value="video">🎥 Video</option>
+        <option value="audio">🎙 Audio only</option>
+      </select>
       <button class="btn" id="playBtn">▶ Play</button>
       <button class="btn pri" id="exportBtn">⬇ Export video</button>
       <span id="time">0:00.0</span>
@@ -72,9 +78,10 @@ a.btn{text-decoration:none;text-align:center}
       <h2>Parts</h2>
       <div id="tracks"></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <label class="btn sm" style="display:inline-block;color:var(--text)">＋ Import guide audio
-          <input type="file" id="importInp" accept="audio/*,video/*" hidden>
+        <label class="btn sm" style="display:inline-block;color:var(--text)">＋ Add audio / video file
+          <input type="file" id="importInp" accept="audio/*,video/*" multiple hidden>
         </label>
+        <input type="file" id="replaceInp" accept="audio/*,video/*" hidden>
       </div>
     </div>
 
@@ -112,6 +119,9 @@ a.btn{text-decoration:none;text-align:center}
         <li>Wear <b>wired headphones</b>. If you use speakers, the earlier parts get recorded into the new take.</li>
         <li>Run <b>Calibrate</b> once on each device and headphone setup (Bluetooth adds a lot of delay).</li>
         <li>Record the bass or guide part first, then the melody, then harmonies, then percussion.</li>
+        <li>Add a song as a backing track with <b>＋ Add audio / video file</b>. Existing videos can be added the same way. Use <b>Delay</b> to line them up.</li>
+        <li>Untick <b>In final</b> to drop a take from playback and export without deleting it. Untick <b>🎧 While recording</b> to stop hearing a part while you record. You can change this during a take.</li>
+        <li>With no video parts in the final result, Export saves an audio file.</li>
         <li>Keep the same framing and lighting for every part.</li>
         <li>Export renders frame by frame, usually faster than real time. Keep the tab open until it finishes.</li>
         <li>Shortcuts: <b>R</b> to record or stop, <b>Space</b> to play or stop.</li>
@@ -151,12 +161,13 @@ const VIDEO_MIMES = ['video/webm;codecs=vp8,opus','video/webm','video/mp4;codecs
 const EXPORT_MIMES = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4;codecs=avc1,mp4a.40.2','video/mp4;codecs=avc1,opus','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','video/mp4'];
 const AUDIO_MIMES = ['audio/webm;codecs=opus','audio/mp4','audio/webm','audio/ogg;codecs=opus'];
 
-const settings = { bpm: 90, countIn: 4, metronome: true, aspect: '9:16', latency: null, mirror: true, labels: false, autoStop: true, matchFirst: false };
+const settings = { bpm: 90, countIn: 4, metronome: true, aspect: '9:16', latency: null, mirror: true, labels: false, autoStop: true, matchFirst: false, recKind: 'video' };
 let tracks = [];
 let ctx = null, master = null, comp = null;
 let mode = 'idle';            // idle | recording | playing | exporting | calibrating | saving
 let transport = null;
 let liveVideo = null, replaceId = null, wakeLock = null;
+let monitoring = false;       // true while recording: per-part "hear while recording" applies instead of "in final"
 const canvas = $('#stage'), g = canvas.getContext('2d');
 
 /* ---------- utils ---------- */
@@ -198,12 +209,15 @@ function click(when, accent, gain) {
 }
 const anySolo = () => tracks.some(t => t.solo);
 const audible = tr => !tr.muted && (!anySolo() || tr.solo);
-function mixList(forExport, excludeId) { return tracks.filter(t => t.buffer && t.id !== excludeId && !(forExport && t.monitorOnly)); }
+const heard = tr => audible(tr) && (monitoring ? tr.hear !== false : !tr.exclude);
+const isRecPart = t => t.source === 'rec';
+// final=true: only parts in the final result (playback/export). final=false: everything, for recording.
+function mixList(final, excludeId) { return tracks.filter(t => t.buffer && t.id !== excludeId && !(final && t.exclude)); }
 function startMix(list, when, from) {
   const c = audio(), srcs = [];
   for (const tr of list) {
     const s = c.createBufferSource(); s.buffer = tr.buffer;
-    const gn = c.createGain(); gn.gain.value = audible(tr) ? tr.gain : 0;
+    const gn = c.createGain(); gn.gain.value = heard(tr) ? tr.gain : 0;
     s.connect(gn); let node = gn;
     if (c.createStereoPanner) { const p = c.createStereoPanner(); p.pan.value = tr.pan; gn.connect(p); node = p; tr._p = p; }
     node.connect(master); tr._g = gn;
@@ -213,11 +227,13 @@ function startMix(list, when, from) {
   }
   return srcs;
 }
-function applyLive() { for (const t of tracks) { if (t._g) t._g.gain.value = audible(t) ? t.gain : 0; if (t._p) t._p.pan.value = t.pan; } }
-// "Match first part's length": the first video part defines the song length; later parts are cut to it.
+function applyLive() { for (const t of tracks) { if (t._g) t._g.gain.value = heard(t) ? t.gain : 0; if (t._p) t._p.pan.value = t.pan; } }
+// "Match first part's length": the first part (video or recorded audio, not an imported backing track)
+// defines the song length; later parts are cut to it.
+const firstPart = () => tracks.find(t => t.buffer && (t.kind === 'video' || isRecPart(t)));
 function songLimit(excludeId) {
   if (!settings.matchFirst) return Infinity;
-  const f = tracks.find(t => t.kind === 'video' && t.buffer);
+  const f = firstPart();
   if (!f || f.id === excludeId) return Infinity;
   return Math.max(0, f.buffer.duration - eff(f));
 }
@@ -233,7 +249,8 @@ function seek(v, t) { if (Math.abs(v.currentTime - t) < 0.01) return Promise.res
 async function fixDuration(v) {   // MediaRecorder WebM files report duration = Infinity until scanned
   if (v.duration === Infinity || isNaN(v.duration)) { const p = once(v, 'durationchange', 2000); v.currentTime = 1e101; await p; v.currentTime = 0; await once(v, 'seeked', 800); }
 }
-const videoTracks = () => tracks.filter(t => t.kind === 'video' && t.el);
+const finalVideos = () => tracks.filter(t => t.kind === 'video' && t.el && !t.exclude);
+const hasFinalVideo = () => tracks.some(t => t.kind === 'video' && t.videoBlob && !t.exclude);
 async function prepareVideos(list, from) {
   await Promise.all(list.map(tr => { tr._playing = false; tr.el.pause(); tr.el.playbackRate = 1; return seek(tr.el, Math.max(0, eff(tr) + from)); }));
 }
@@ -254,7 +271,7 @@ const DB = {
   db: null,
   open() { return new Promise((res, rej) => { const r = indexedDB.open('acapella-studio', 1); r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('tracks', { keyPath: 'id' }); d.createObjectStore('meta'); }; r.onsuccess = () => { this.db = r.result; res(); }; r.onerror = () => rej(r.error); }); },
   tx(store, mode, fn) { if (!this.db) return Promise.resolve(null); return new Promise((res, rej) => { const t = this.db.transaction(store, mode); const req = fn(t.objectStore(store)); t.oncomplete = () => res(req && req.result); t.onerror = () => rej(t.error); }); },
-  putTrack(t) { const { buffer, url, el, _g, _p, _playing, ...rest } = t; return this.tx('tracks', 'readwrite', s => s.put(rest)).catch(e => toast('Could not save: ' + e.message)); },
+  putTrack(t) { const { buffer, url, el, _g, _p, _playing, _silent, ...rest } = t; return this.tx('tracks', 'readwrite', s => s.put(rest)).catch(e => toast('Could not save: ' + e.message)); },
   delTrack(id) { return this.tx('tracks', 'readwrite', s => s.delete(id)); },
   clear() { return this.tx('tracks', 'readwrite', s => s.clear()); },
   allTracks() { return this.tx('tracks', 'readonly', s => s.getAll()); },
@@ -268,9 +285,13 @@ function saveTrackSoon(tr) { clearTimeout(saveTimers[tr.id]); saveTimers[tr.id] 
 async function hydrate(tr) {
   if (tr.url) URL.revokeObjectURL(tr.url);
   if (tr.el) { tr.el.remove(); tr.el = null; }
-  tr.buffer = null;
+  tr.buffer = null; tr._silent = false;
+  let err = null;
   try { tr.buffer = await decode(await (tr.audioBlob || tr.videoBlob).arrayBuffer()); }
-  catch (e) { if (tr.videoBlob && tr.audioBlob) tr.buffer = await decode(await tr.videoBlob.arrayBuffer()); else throw e; }
+  catch (e) {
+    err = e;
+    if (tr.videoBlob && tr.audioBlob) try { tr.buffer = await decode(await tr.videoBlob.arrayBuffer()); } catch (e2) {}
+  }
   if (tr.kind === 'video' && tr.videoBlob) {
     const v = document.createElement('video');
     v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto';
@@ -278,8 +299,53 @@ async function hydrate(tr) {
     $('#vids').appendChild(v); tr.el = v;
     await once(v, 'loadeddata', 4000);
     await fixDuration(v);
+    if (!tr.buffer) {   // video file without a sound track: use silence of the same length
+      if (!(v.duration > 0 && isFinite(v.duration))) { v.remove(); tr.el = null; URL.revokeObjectURL(tr.url); tr.url = null; throw err || new Error('Unreadable video'); }
+      const c = audio(); tr.buffer = c.createBuffer(1, Math.ceil(v.duration * c.sampleRate), c.sampleRate); tr._silent = true;
+    }
     await seek(v, Math.max(0, eff(tr)));
   }
+  if (!tr.buffer) throw err || new Error('Unreadable file');
+}
+// Returns true if the file has a picture (so it becomes a video part), false for audio-only files.
+function probeVideo(file) {
+  if (/^audio\//.test(file.type)) return Promise.resolve(false);
+  return new Promise(res => {
+    const v = document.createElement('video'), u = URL.createObjectURL(file); let done = false;
+    const fin = r => { if (done) return; done = true; URL.revokeObjectURL(u); v.removeAttribute('src'); v.load(); res(r); };
+    v.muted = true; v.preload = 'metadata';
+    v.onloadedmetadata = () => fin(v.videoWidth > 0);
+    v.onerror = () => fin(false);
+    setTimeout(() => fin(false), 6000);
+    v.src = u;
+  });
+}
+// Fill a new part (tr = null) or replace an existing part's media with a file from the device.
+async function addFile(f, tr = null) {
+  const isVid = await probeVideo(f);
+  const media = { kind: isVid ? 'video' : 'audio', source: 'file', videoBlob: isVid ? f : null, audioBlob: isVid ? null : f, offset: 0, shift: 0, exclude: false };
+  if (!tr) {
+    const n = { id: uid(), name: f.name.replace(/\.[^.]+$/, '').slice(0, 40) || (isVid ? 'Video' : 'Audio'), gain: isVid ? 1 : 0.8, pan: 0, muted: false, solo: false, hear: true, created: Date.now(), ...media };
+    await hydrate(n);
+    tracks.push(n); await DB.putTrack(n);
+    return n;
+  }
+  const prev = {}; for (const k in media) prev[k] = tr[k];
+  Object.assign(tr, media);
+  try { await hydrate(tr); }
+  catch (e) { Object.assign(tr, prev); try { await hydrate(tr); } catch (_) {} throw e; }
+  await DB.putTrack(tr);
+  return tr;
+}
+function downloadPart(tr) {
+  const b = tr.videoBlob || tr.audioBlob; if (!b) return;
+  const t = (b.type || '').split(';')[0];
+  const ext = (b.name && /\.([a-z0-9]{2,5})$/i.exec(b.name)?.[1]) ||
+    ({ 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/ogg': 'ogg' })[t] || 'webm';
+  const base = (tr.name || 'part').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'part';
+  const a = document.createElement('a'), u = URL.createObjectURL(b);
+  a.href = u; a.download = base + '.' + ext; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 60000);
 }
 
 /* ---------- media capture ---------- */
@@ -292,26 +358,30 @@ function getStream(video) {
 async function record(replace = null) {
   if (mode !== 'idle') return;
   if (!navigator.mediaDevices || !window.MediaRecorder) return toast('This browser cannot record here. Open the page over https:// in Chrome, Safari or Firefox.');
+  const target = replace ? tracks.find(t => t.id === replace) : null;
+  const withVideo = (target ? target.kind : settings.recKind) === 'video';
   const c = audio(); await c.resume();
   let stream;
-  try { stream = await getStream(true); } catch (e) { return toast('Camera/mic blocked: ' + e.message); }
+  try { stream = await getStream(withVideo); } catch (e) { return toast((withVideo ? 'Camera/mic' : 'Mic') + ' blocked: ' + e.message); }
   mode = 'saving'; ui();
   replaceId = replace;
-  liveVideo = document.createElement('video');
-  liveVideo.muted = true; liveVideo.playsInline = true; liveVideo.setAttribute('playsinline', ''); liveVideo.srcObject = stream;
-  $('#vids').appendChild(liveVideo); try { await liveVideo.play(); } catch (e) {}
+  if (withVideo) {
+    liveVideo = document.createElement('video');
+    liveVideo.muted = true; liveVideo.playsInline = true; liveVideo.setAttribute('playsinline', ''); liveVideo.srcObject = stream;
+    $('#vids').appendChild(liveVideo); try { await liveVideo.play(); } catch (e) {}
+  }
 
-  const vm = pick(VIDEO_MIMES), am = pick(AUDIO_MIMES);
-  const vRec = new MediaRecorder(stream, vm ? { mimeType: vm, videoBitsPerSecond: 3e6 } : {});
+  const vm = withVideo ? pick(VIDEO_MIMES) : '', am = pick(AUDIO_MIMES);
+  const vRec = withVideo ? new MediaRecorder(stream, vm ? { mimeType: vm, videoBitsPerSecond: 3e6 } : {}) : null;
   const aRec = new MediaRecorder(new MediaStream(stream.getAudioTracks()), am ? { mimeType: am, audioBitsPerSecond: 192000 } : {});
   const vChunks = [], aChunks = [];
-  vRec.ondataavailable = e => e.data.size && vChunks.push(e.data);
+  if (vRec) vRec.ondataavailable = e => e.data.size && vChunks.push(e.data);
   aRec.ondataavailable = e => e.data.size && aChunks.push(e.data);
 
-  const vids = videoTracks().filter(t => t.id !== replace);
+  const vids = finalVideos().filter(t => t.id !== replace);
   await prepareVideos(vids, 0);
   const started = once(aRec, 'start', 3000);
-  aRec.start(); vRec.start();
+  aRec.start(); if (vRec) vRec.start();
   await started;
   const recStart = c.currentTime;
   const beat = 60 / settings.bpm, lead = 0.25;
@@ -319,6 +389,7 @@ async function record(replace = null) {
   const clicks = [];
   for (let i = 0; i < settings.countIn; i++) clicks.push(click(countStart + i * beat, i === 0));
   const list = mixList(false, replace);
+  monitoring = true;
   transport = { when: songZero, recStart, countStart, beat, videos: vids, sources: startMix(list, songZero, 0), clicks, end: songLimit(replace), backingEnd: computeEnd(list, []), rec: { vRec, aRec, vChunks, aChunks, stream, vm, am } };
   if (settings.metronome) {
     let next = songZero, n = 0;
@@ -331,7 +402,7 @@ async function stopRecording() {
   if (mode !== 'recording') return;
   mode = 'saving'; ui();
   const T = transport, { vRec, aRec, vChunks, aChunks, stream, vm, am } = T.rec;
-  const stopped = Promise.all([vRec, aRec].map(r => new Promise(res => { if (r.state === 'inactive') return res(); r.addEventListener('stop', res, { once: true }); r.stop(); })));
+  const stopped = Promise.all([vRec, aRec].filter(Boolean).map(r => new Promise(res => { if (r.state === 'inactive') return res(); r.addEventListener('stop', res, { once: true }); r.stop(); })));
   const songZeroRel = T.when - T.recStart, tAtStop = ctx.currentTime - T.when;
   stopTransport();
   await stopped;
@@ -339,13 +410,13 @@ async function stopRecording() {
   if (liveVideo) { liveVideo.remove(); liveVideo = null; }
   lockScreen(false);
   if (tAtStop < 0.5) { toast('Take too short, so it was discarded.'); replaceId = null; mode = 'idle'; ui(); return; }
-  const videoBlob = new Blob(vChunks, { type: vRec.mimeType || vm || 'video/webm' });
+  const videoBlob = vRec ? new Blob(vChunks, { type: vRec.mimeType || vm || 'video/webm' }) : null;
   const audioBlob = new Blob(aChunks, { type: aRec.mimeType || am || 'audio/webm' });
   const offset = songZeroRel + latency();
   let tr;
-  if (replaceId) { tr = tracks.find(t => t.id === replaceId); Object.assign(tr, { videoBlob, audioBlob, offset, shift: 0 }); }
+  if (replaceId) { tr = tracks.find(t => t.id === replaceId); Object.assign(tr, { videoBlob, audioBlob, offset, shift: 0, source: 'rec', exclude: false }); }
   else {
-    tr = { id: uid(), name: 'Part ' + (tracks.filter(t => t.kind === 'video').length + 1), kind: 'video', offset, shift: 0, gain: 1, pan: 0, muted: false, solo: false, monitorOnly: false, videoBlob, audioBlob, created: Date.now() };
+    tr = { id: uid(), name: 'Part ' + (tracks.filter(t => t.kind === 'video' || isRecPart(t)).length + 1), kind: vRec ? 'video' : 'audio', source: 'rec', offset, shift: 0, gain: 1, pan: 0, muted: false, solo: false, exclude: false, hear: true, videoBlob, audioBlob, created: Date.now() };
     tracks.push(tr);
   }
   replaceId = null;
@@ -358,8 +429,8 @@ async function stopRecording() {
 async function play() {
   if (mode !== 'idle') return;
   const c = audio(); await c.resume();
-  const vids = videoTracks(), list = mixList(false);
-  if (!vids.length && !list.length) return toast('Record a part first.');
+  const vids = finalVideos(), list = mixList(true);
+  if (!vids.length && !list.length) return toast(tracks.length ? 'No parts are in the final result. Tick "In final" on a part.' : 'Record a part first.');
   await prepareVideos(vids, 0);
   const when = c.currentTime + 0.15;
   transport = { when, videos: vids, sources: startMix(list, when, 0), end: computeEnd(list, vids) };
@@ -367,7 +438,7 @@ async function play() {
 }
 function stopTransport() {
   if (!transport) return;
-  const T = transport; transport = null;
+  const T = transport; transport = null; monitoring = false;
   T.sources.forEach(s => { try { s.stop(); } catch (e) {} });
   (T.clicks || []).forEach(o => { try { o.stop(); } catch (e) {} });
   clearInterval(T.metroTimer);
@@ -450,8 +521,9 @@ async function pickFormat(W, H) {
 }
 async function exportVideo() {
   if (mode !== 'idle') return;
-  const vids = tracks.filter(t => t.kind === 'video' && t.videoBlob && t.buffer), list = mixList(true);
-  if (!vids.length && !list.length) return toast('Nothing to export yet.');
+  const vids = tracks.filter(t => t.kind === 'video' && t.videoBlob && t.buffer && !t.exclude), list = mixList(true);
+  if (!vids.length && !list.length) return toast(tracks.length ? 'No parts are in the final result. Tick "In final" on a part.' : 'Nothing to export yet.');
+  if (!vids.length) return exportAudio(list);
   const canOffline = window.MB && window.VideoEncoder && window.AudioEncoder && window.VideoDecoder && window.OfflineAudioContext;
   if (canOffline) {
     try { const ok = await exportOffline(vids, list); if (ok) return; }
@@ -492,7 +564,7 @@ async function exportOffline(vids, list) {
       if (offline.cancel) break;
       const samples = await Promise.all(iters.map(it => it ? it.next().then(r => r.value || null) : null));
       gc.fillStyle = '#0b0c10'; gc.fillRect(0, 0, W, H);
-      vids.forEach((tr, k) => drawTile({ sample: samples[k], name: tr.name }, rects[k], gc));
+      vids.forEach((tr, k) => drawTile({ sample: samples[k], name: tr.name, mirror: mirrored(tr) }, rects[k], gc));
       samples.forEach(sm => sm && sm.close());
       await vs.add(i / fps, 1 / fps);
       if (i % 10 === 0) {
@@ -520,7 +592,7 @@ async function exportOffline(vids, list) {
 }
 async function exportRealtime() {
   if (mode !== 'idle') return;
-  const vids = videoTracks(), list = mixList(true);
+  const vids = finalVideos(), list = mixList(true);
   if (!canvas.captureStream || !window.MediaRecorder) return toast('This browser cannot export video. Try the latest Chrome or Safari.');
   const c = audio(); await c.resume();
   const duration = computeEnd(list, vids);
@@ -540,6 +612,44 @@ async function exportRealtime() {
   lockScreen(true);
 }
 let lastExportUrl = null, lastExportFile = null;
+// Audio-only result: AAC in .m4a when the browser can encode it, otherwise a plain WAV.
+async function exportAudio(list) {
+  const duration = computeEnd(list, []);
+  if (!(duration > 0)) return toast('Nothing to export yet.');
+  mode = 'exporting'; ui(); showExport(true);
+  $('#expTitle').textContent = 'Exporting audio…';
+  $('#expInfo').textContent = 'Rendering the audio mix…';
+  try {
+    const mix = await renderMix(list, duration);
+    let blob = null, ext = 'wav';
+    const MB = window.MB;
+    if (MB && window.AudioEncoder) {
+      try {
+        if (await MB.canEncodeAudio('aac', { numberOfChannels: 2, sampleRate: mix.sampleRate, bitrate: 192000 })) {
+          $('#expInfo').textContent = 'Encoding…';
+          const out = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: 'in-memory' }), target: new MB.BufferTarget() });
+          const as = new MB.AudioBufferSource({ codec: 'aac', bitrate: 192000 });
+          out.addAudioTrack(as); await out.start(); await as.add(mix); await out.finalize();
+          blob = new Blob([out.target.buffer], { type: 'audio/mp4' }); ext = 'm4a';
+        }
+      } catch (e) { console.warn('m4a export failed, using WAV', e); blob = null; }
+    }
+    if (!blob) blob = toWav(mix);
+    showResult(blob, ext);
+  } catch (e) { console.error(e); showExport(false); toast('Export failed: ' + e.message, 5000); }
+  mode = 'idle'; ui();
+}
+function toWav(buf) {
+  const ch = buf.numberOfChannels, n = buf.length, sr = buf.sampleRate, size = 44 + n * ch * 2;
+  const dv = new DataView(new ArrayBuffer(size)), str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); dv.setUint32(4, size - 8, true); str(8, 'WAVE'); str(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, ch, true); dv.setUint32(24, sr, true);
+  dv.setUint32(28, sr * ch * 2, true); dv.setUint16(32, ch * 2, true); dv.setUint16(34, 16, true); str(36, 'data'); dv.setUint32(40, n * ch * 2, true);
+  const data = []; for (let c = 0; c < ch; c++) data.push(buf.getChannelData(c));
+  let o = 44;
+  for (let i = 0; i < n; i++) for (let c = 0; c < ch; c++) { const v = Math.max(-1, Math.min(1, data[c][i])); dv.setInt16(o, v < 0 ? v * 0x8000 : v * 0x7fff, true); o += 2; }
+  return new Blob([dv.buffer], { type: 'audio/wav' });
+}
 async function finishExport(cancel) {
   if (mode !== 'exporting' || !transport) return;
   const { rec, ch, dest, em } = transport.exp;
@@ -593,7 +703,7 @@ function drawTile(tile, r, gc = g) {
   if (vw) {
     const s = Math.max(r.w / vw, r.h / vh), sw = r.w / s, sh = r.h / s, sx = (vw - sw) / 2, sy = (vh - sh) / 2;
     let dx = r.x, dy = r.y;
-    if (settings.mirror) { gc.translate(r.x + r.w, r.y); gc.scale(-1, 1); dx = 0; dy = 0; }
+    if (tile.mirror) { gc.translate(r.x + r.w, r.y); gc.scale(-1, 1); dx = 0; dy = 0; }
     if (smp) {
       if (smp.rotation) { const tmp = rotCanvas(vw, vh); smp.drawWithFit(tmp.getContext('2d'), { fit: 'fill' }); gc.drawImage(tmp, sx, sy, sw, sh, dx, dy, r.w, r.h); }
       else smp.draw(gc, sx, sy, sw, sh, dx, dy, r.w, r.h);
@@ -614,12 +724,14 @@ function drawTile(tile, r, gc = g) {
 }
 let _rot = null;
 function rotCanvas(w, h) { if (!_rot) _rot = document.createElement('canvas'); if (_rot.width !== w || _rot.height !== h) { _rot.width = w; _rot.height = h; } return _rot; }
+// Only camera takes get mirrored; imported files are shown as they are.
+const mirrored = t => settings.mirror && t.source !== 'file';
 function currentTiles() {
   const tiles = [], rec = mode === 'recording' && liveVideo;
-  const live = { el: liveVideo, name: 'Recording…', live: true };
+  const live = { el: liveVideo, name: 'Recording…', live: true, mirror: settings.mirror };
   for (const t of tracks) if (t.kind === 'video') {
     if (rec && t.id === replaceId) tiles.push(live);
-    else if (t.el) tiles.push({ el: t.el, name: t.name });
+    else if (t.el && !t.exclude && (!transport || transport.videos.includes(t))) tiles.push({ el: t.el, name: t.name, mirror: mirrored(t) });
   }
   if (rec && !replaceId) tiles.push(live);
   return tiles;
@@ -644,7 +756,15 @@ function render() {
   tiles.forEach((tile, i) => drawTile(tile, rects[i]));
   if (!tiles.length) {
     g.fillStyle = '#8a90a0'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.font = `500 ${Math.round(W * 0.04)}px system-ui,sans-serif`;
-    g.fillText('Press ● Record part to add your first part', W / 2, H / 2);
+    const msg = mode === 'recording' ? '🎙 Recording audio…' : !tracks.length ? 'Press ● Record part to add your first part'
+      : tracks.some(t => t.kind === 'video') ? 'No video parts in the final result' : '🎵 Audio-only project';
+    g.fillText(msg, W / 2, H / 2);
+  } else if (mode === 'recording' && !liveVideo && t != null && t >= 0) {   // audio-only take over existing videos
+    const fs = Math.round(Math.min(W, H) * 0.045);
+    g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(0, 0, W, fs * 2);
+    g.fillStyle = '#ff4d6d'; g.beginPath(); g.arc(fs, fs, fs * 0.35, 0, 7); g.fill();
+    g.fillStyle = '#fff'; g.font = `700 ${fs * 0.8}px system-ui,sans-serif`; g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText('REC audio', fs * 1.6, fs);
   }
   if (mode === 'recording' && transport && t != null && t < 0) {
     const el = ctx.currentTime - transport.countStart;
@@ -665,26 +785,33 @@ function ui() {
   const pb = $('#playBtn');
   pb.textContent = mode === 'playing' ? '■ Stop' : '▶ Play';
   pb.disabled = busy && mode !== 'playing';
-  $('#exportBtn').disabled = busy; $('#calBtn').disabled = busy; $('#newBtn').disabled = busy;
-  document.querySelectorAll('#tracks [data-act="rec"],#tracks [data-act="del"]').forEach(b => b.disabled = busy);
+  $('#exportBtn').disabled = busy; $('#calBtn').disabled = busy; $('#newBtn').disabled = busy; $('#recKind').disabled = busy;
+  $('#exportBtn').textContent = tracks.length && !hasFinalVideo() ? '⬇ Export audio' : '⬇ Export video';
+  document.querySelectorAll('#tracks [data-act="rec"],#tracks [data-act="del"],#tracks [data-act="file"]').forEach(b => b.disabled = busy);
   if (!transport) $('#time').textContent = mode === 'calibrating' ? 'Calibrating…' : mode === 'saving' ? 'Working…' : fmt(0);
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function lenNote(t) {
-  const len = Math.max(0, t.buffer.duration - eff(t)), lim = songLimit();
-  if (!isFinite(lim)) return `<span class="muted">Length ${fmt(len)}</span>`;
-  if (t === tracks.find(x => x.kind === 'video' && x.buffer)) return `<span class="muted">Length ${fmt(len)} · sets the song length</span>`;
-  return `<span class="muted">Length ${fmt(len)}${len > lim + 0.05 ? ` · cut to ${fmt(lim)}` : ''}</span>`;
+  const len = Math.max(0, t.buffer.duration - eff(t)), lim = songLimit(), ns = t._silent ? ' · no sound' : '';
+  if (!isFinite(lim)) return `<span class="muted">Length ${fmt(len)}${ns}</span>`;
+  if (t === firstPart()) return `<span class="muted">Length ${fmt(len)}${ns} · sets the song length</span>`;
+  return `<span class="muted">Length ${fmt(len)}${ns}${len > lim + 0.05 ? ` · cut to ${fmt(lim)}` : ''}</span>`;
+}
+function badge(t) {
+  if (t.kind === 'video') return t.source === 'file' ? '🎥 file' : '🎥';
+  return t.source === 'file' ? '🎵 file' : '🎙';
 }
 function renderTracks() {
   const box = $('#tracks');
-  if (!tracks.length) { box.innerHTML = '<p class="muted">No parts yet. Put on headphones and press <b>● Record part</b>.</p>'; return ui(); }
+  if (!tracks.length) { box.innerHTML = '<p class="muted">No parts yet. Put on headphones and press <b>● Record part</b>, or add an audio or video file.</p>'; return ui(); }
   box.innerHTML = tracks.map(t => `
-    <div class="trk" data-id="${t.id}">
+    <div class="trk${t.exclude ? ' off' : ''}" data-id="${t.id}">
       <div class="row">
-        <span class="badge">${t.kind === 'video' ? '🎥' : '🎵 guide'}</span>
+        <span class="badge">${badge(t)}</span>
         <input class="name" data-k="name" value="${esc(t.name)}" aria-label="Part name">
-        ${t.kind === 'video' ? '<button class="btn sm" data-act="rec" title="Re-record this part">⟲ Redo</button>' : ''}
+        ${t.kind === 'video' || isRecPart(t) ? `<button class="btn sm" data-act="rec" title="Re-record this part (${t.kind === 'video' ? 'camera' : 'mic only'})">⟲ Redo</button>` : ''}
+        <button class="btn sm" data-act="file" title="Replace with a file from this device">📁</button>
+        <button class="btn sm" data-act="dl" title="Download this part's original file">⬇</button>
         <button class="btn sm" data-act="del" title="Delete">🗑</button>
       </div>
       <div class="row">
@@ -699,7 +826,10 @@ function renderTracks() {
         <input class="num" type="number" step="5" data-k="shift" value="${t.shift || 0}" aria-label="Delay in ms">
         <button class="btn sm" data-act="sh+">+</button><span class="muted">ms</span>
       </div>
-      <label class="inl"><input type="checkbox" data-k="monitorOnly" ${t.monitorOnly ? 'checked' : ''}> Headphones only (leave out of export)</label>
+      <div class="row" style="gap:14px">
+        <label class="inl" title="Include this part in playback and the exported result"><input type="checkbox" data-k="include" ${t.exclude ? '' : 'checked'}> In final</label>
+        <label class="inl" title="Hear this part in your headphones while recording a new take"><input type="checkbox" data-k="hear" ${t.hear !== false ? 'checked' : ''}> 🎧 While recording</label>
+      </div>
       ${t.buffer ? lenNote(t) : '<span class="muted">⚠ Could not load this part on this device.</span>'}
     </div>`).join('');
   ui();
@@ -708,7 +838,8 @@ $('#tracks').addEventListener('input', e => {
   const k = e.target.dataset.k, tr = tracks.find(t => t.id === e.target.closest('.trk')?.dataset.id);
   if (!k || !tr) return;
   if (k === 'name') tr.name = e.target.value;
-  else if (k === 'monitorOnly') tr.monitorOnly = e.target.checked;
+  else if (k === 'include') { tr.exclude = !e.target.checked; e.target.closest('.trk').classList.toggle('off', tr.exclude); ui(); }
+  else if (k === 'hear') tr.hear = e.target.checked;
   else if (k === 'shift') { tr.shift = Number(e.target.value) || 0; if (!transport && tr.el) seek(tr.el, Math.max(0, eff(tr))); }
   else tr[k] = Number(e.target.value);
   applyLive(); saveTrackSoon(tr);
@@ -721,6 +852,8 @@ $('#tracks').addEventListener('click', async e => {
   else if (act === 'solo') { tr.solo = !tr.solo; b.classList.toggle('on', tr.solo); }
   else if (act === 'sh-' || act === 'sh+') { tr.shift = (tr.shift || 0) + (act === 'sh+' ? 10 : -10); b.parentElement.querySelector('[data-k="shift"]').value = tr.shift; if (!transport && tr.el) seek(tr.el, Math.max(0, eff(tr))); }
   else if (act === 'rec') return record(tr.id);
+  else if (act === 'dl') return downloadPart(tr);
+  else if (act === 'file') { replaceTarget = tr; return $('#replaceInp').click(); }
   else if (act === 'del') {
     if (!confirm(`Delete "${tr.name}"?`)) return;
     tracks = tracks.filter(t => t !== tr); if (tr.el) tr.el.remove(); if (tr.url) URL.revokeObjectURL(tr.url);
@@ -740,18 +873,32 @@ $('#newBtn').onclick = async () => {
   tracks = []; await DB.clear(); renderTracks();
 };
 $('#importInp').onchange = async e => {
-  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-  const tr = { id: uid(), name: f.name.replace(/\.[^.]+$/, '').slice(0, 40) || 'Guide', kind: 'audio', offset: 0, shift: 0, gain: 0.8, pan: 0, muted: false, solo: false, monitorOnly: true, audioBlob: f, created: Date.now() };
-  try { await hydrate(tr); } catch (err) { return toast('Could not read that file: ' + err.message); }
-  tracks.push(tr); await DB.putTrack(tr); renderTracks(); toast('Guide added. You will hear it in your headphones, but it is left out of the export by default.');
+  const files = [...e.target.files]; e.target.value = ''; if (!files.length) return;
+  if (mode !== 'idle') return toast('Stop playback or recording first.');
+  mode = 'saving'; ui();
+  let added = 0;
+  for (const f of files) {
+    try { await addFile(f); added++; } catch (err) { toast(`Could not read "${f.name}": ` + err.message, 5000); }
+  }
+  mode = 'idle'; renderTracks();
+  if (added) toast(added === 1 ? `Added "${tracks[tracks.length - 1].name}". Use Delay to line it up.` : `Added ${added} files. Use Delay to line them up.`);
+};
+let replaceTarget = null;
+$('#replaceInp').onchange = async e => {
+  const f = e.target.files[0], tr = replaceTarget; e.target.value = ''; replaceTarget = null;
+  if (!f || !tr || !tracks.includes(tr)) return;
+  if (mode !== 'idle') return toast('Stop playback or recording first.');
+  mode = 'saving'; ui();
+  try { await addFile(f, tr); toast(`"${tr.name}" now uses ${f.name}.`); } catch (err) { toast('Could not read that file: ' + err.message, 5000); }
+  mode = 'idle'; renderTracks();
 };
 function bindSettings() {
-  $('#bpm').value = settings.bpm; $('#countIn').value = String(settings.countIn); $('#aspect').value = settings.aspect;
+  $('#bpm').value = settings.bpm; $('#countIn').value = String(settings.countIn); $('#aspect').value = settings.aspect; $('#recKind').value = settings.recKind;
   $('#metronome').checked = settings.metronome; $('#autoStop').checked = settings.autoStop; $('#matchFirst').checked = settings.matchFirst; $('#mirror').checked = settings.mirror; $('#labels').checked = settings.labels;
   $('#latency').value = Math.round(latency() * 1000);
   $('#latInfo').textContent = settings.latency == null ? 'Estimated (calibrate for accuracy)' : 'Calibrated ✓';
 }
-[['bpm', v => settings.bpm = Math.min(300, Math.max(30, Number(v) || 90))], ['countIn', v => settings.countIn = Number(v)], ['aspect', v => settings.aspect = v],
+[['bpm', v => settings.bpm = Math.min(300, Math.max(30, Number(v) || 90))], ['countIn', v => settings.countIn = Number(v)], ['aspect', v => settings.aspect = v], ['recKind', v => settings.recKind = v === 'audio' ? 'audio' : 'video'],
  ['latency', v => settings.latency = Math.max(0, Number(v) || 0) / 1000]].forEach(([id, f]) => $('#' + id).addEventListener('change', e => { f(e.target.value); saveSettings(); bindSettings(); }));
 ['metronome', 'autoStop', 'mirror', 'labels', 'matchFirst'].forEach(id => $('#' + id).addEventListener('change', e => { settings[id] = e.target.checked; saveSettings(); if (id === 'matchFirst') renderTracks(); }));
 document.addEventListener('keydown', e => {
@@ -766,6 +913,11 @@ async function init() {
     await DB.open();
     const m = await DB.getMeta(); if (m) Object.assign(settings, m);
     tracks = ((await DB.allTracks()) || []).sort((a, b) => a.created - b.created);
+    for (const t of tracks) {   // older projects: "headphones only" guides become parts left out of the final result
+      if (!t.source) t.source = t.kind === 'video' ? 'rec' : 'file';
+      if (t.exclude == null) t.exclude = !!t.monitorOnly;
+      delete t.monitorOnly;
+    }
   } catch (e) { DB.db = null; toast('Storage is unavailable, so takes will not be saved after reload.'); }
   bindSettings(); renderTracks(); requestAnimationFrame(frame);
   for (const tr of tracks) { try { await hydrate(tr); } catch (e) { console.warn('hydrate failed', e); } }
